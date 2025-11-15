@@ -1,0 +1,12 @@
+{
+  "name": "p2p-signaling-server",
+  "version": "1.0.0",
+  "description": "Simple WebSocket signaling server for WebRTC P2P file sharing",
+  "main": "signaling-server.js",
+  "scripts": {
+    "start": "node signaling-server.js"
+  },
+  "dependencies": {
+    "ws": "^8.13.0"
+  }
+}Commit new file

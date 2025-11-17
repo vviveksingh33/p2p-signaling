@@ -1,10 +1,10 @@
 // signaling-server.js
-// Production-minded Socket.IO signaling server with:
-// - secure room token (join requires token)
-// - TTL, maxPeers, usageLimit
-// - per-socket rate limiting and connection limits
-// - optional Redis adapter hint (commented)
-// - Railway-ready: uses process.env.PORT
+// Production-minded Socket.IO signaling server (single-file ready to paste).
+// - Single PORT declaration (no duplicates).
+// - Basic health endpoints for platform checks.
+// - Room/token/ttl/maxPeers/usageLimit support.
+// - Simple rate limiting per-socket.
+// - Uses process.env.PORT (Railway compatible).
 
 const express = require('express');
 const http = require('http');
@@ -14,35 +14,25 @@ const crypto = require('crypto');
 const app = express();
 const server = http.createServer(app);
 
-// Basic configuration via env
+// SINGLE PORT declaration — DO NOT duplicate this anywhere else in file
 const PORT = process.env.PORT || 3000;
+
+// Configuration (env override)
 const MAX_CONNECTIONS_PER_IP = parseInt(process.env.MAX_CONN_PER_IP || '10', 10);
 const MSGS_PER_SECOND = parseInt(process.env.MSGS_PER_SECOND || '10', 10);
 const ROOM_CODE_LEN = parseInt(process.env.ROOM_CODE_LEN || '7', 10);
 
-// Optional: Redis adapter for socket.io when scaling. (requires @socket.io/redis-adapter)
-// const { createAdapter } = require('@socket.io/redis-adapter');
-// const { createClient } = require('redis');
-// if (process.env.REDIS_URL) {
-//   const pubClient = createClient({ url: process.env.REDIS_URL });
-//   const subClient = pubClient.duplicate();
-//   await pubClient.connect();
-//   await subClient.connect();
-//   io.adapter(createAdapter(pubClient, subClient));
-// }
-
+// Create Socket.IO server
 const io = new Server(server, {
-  cors: { origin: '*' } // restrict origin in production
+  cors: { origin: '*' } // in production restrict to your domain(s)
 });
 
-// Simple in-memory stores (replace with Redis for horizontal scale)
-const rooms = new Map(); // roomCode -> { hostSocketId, token, peers:Set(socketId), createdAt, ttlMs, maxPeers, usageLeft }
+// In-memory stores (replace w/ Redis for scale)
+const rooms = new Map(); // code -> meta
 const ipConnections = new Map(); // ip -> Set(socketId)
-
-// In-memory rate limiter per socket: token bucket
 const rateBuckets = new Map(); // socketId -> { tokens, lastRefill }
 
-// Utility functions
+// Utils
 function genCode(len = ROOM_CODE_LEN) {
   return crypto.randomBytes(Math.ceil(len * 3 / 4)).toString('base64')
     .replace(/[^a-zA-Z0-9]/g, '')
@@ -54,20 +44,20 @@ function genToken(len = 32) {
 }
 function nowMs() { return Date.now(); }
 
-// Room cleanup interval (TTL)
+// Periodic cleanup for TTL
 const CLEAN_INTERVAL_MS = 30 * 1000;
 setInterval(() => {
   const now = nowMs();
   for (const [code, meta] of rooms.entries()) {
     if (meta.ttlMs && (meta.createdAt + meta.ttlMs) <= now) {
-      io.to(meta.roomRoomName || code).emit('room-expired', { code, reason: 'ttl' });
+      io.to(meta.roomRoomName).emit('room-expired', { code, reason: 'ttl' });
       rooms.delete(code);
       console.log('room removed (ttl):', code);
     }
   }
 }, CLEAN_INTERVAL_MS);
 
-// Middleware-ish helpers
+// IP connection helpers
 function addIpConnection(ip, socketId) {
   const s = ipConnections.get(ip) || new Set();
   s.add(socketId);
@@ -85,7 +75,7 @@ function getIpCount(ip) {
   return s ? s.size : 0;
 }
 
-// Rate bucket functions
+// Rate limiter token-bucket
 function ensureBucket(socketId) {
   if (!rateBuckets.has(socketId)) {
     rateBuckets.set(socketId, { tokens: MSGS_PER_SECOND, lastRefill: nowMs() });
@@ -108,14 +98,19 @@ function consumeToken(socketId) {
   return false;
 }
 
-// Health endpoint
-app.get('/health', (req, res) => res.json({ ok: true, uptime: process.uptime() }));
+// Simple HTTP endpoints (platform health checks)
+app.get('/', (req, res) => {
+  res.send('Signaling server live');
+});
+app.get('/health', (req, res) => {
+  res.json({ ok: true, uptime: process.uptime(), now: Date.now() });
+});
 
+// Socket.IO handlers
 io.on('connection', (socket) => {
   const ip = socket.handshake.address || socket.conn.remoteAddress || 'unknown';
   console.log('connect', socket.id, 'ip', ip);
 
-  // Enforce per-IP connection limit
   addIpConnection(ip, socket.id);
   if (getIpCount(ip) > MAX_CONNECTIONS_PER_IP) {
     console.warn('ip connection limit reached for', ip);
@@ -124,12 +119,9 @@ io.on('connection', (socket) => {
     return;
   }
 
-  // On create-room: opts = { ttlMinutes, maxPeers, usageLimit }
   socket.on('create-room', (opts = {}, cb = () => {}) => {
     try {
-      if (!consumeToken(socket.id)) {
-        return cb({ ok: false, error: 'rate_limit' });
-      }
+      if (!consumeToken(socket.id)) return cb({ ok: false, error: 'rate_limit' });
 
       const code = genCode();
       const token = genToken(16);
@@ -145,13 +137,13 @@ io.on('connection', (socket) => {
         ttlMs: ttlMinutes * 60 * 1000,
         maxPeers,
         usageLeft,
-        roomRoomName: `room-${code}` // socket.io room name
+        roomRoomName: `room-${code}`
       };
 
       rooms.set(code, meta);
       socket.join(meta.roomRoomName);
 
-      console.log('room created', code, 'host', socket.id, 'ttlMin', ttlMinutes, 'maxPeers', maxPeers, 'usageLeft', usageLeft);
+      console.log('room created', code, 'host', socket.id);
       cb({ ok: true, code, token, ttlMinutes, maxPeers, usageLeft });
     } catch (err) {
       console.error('create-room error', err);
@@ -159,12 +151,9 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Join-room requires both code and token
   socket.on('join-room', (payload = {}, cb = () => {}) => {
     try {
-      if (!consumeToken(socket.id)) {
-        return cb({ ok: false, error: 'rate_limit' });
-      }
+      if (!consumeToken(socket.id)) return cb({ ok: false, error: 'rate_limit' });
       const { code, token } = payload;
       if (!code || !token) return cb({ ok: false, error: 'missing_params' });
 
@@ -176,7 +165,6 @@ io.on('connection', (socket) => {
       meta.peers.add(socket.id);
       socket.join(meta.roomRoomName);
       console.log('peer joined', socket.id, 'room', code);
-      // Notify host
       io.to(meta.hostSocketId).emit('peer-joined', { peerId: socket.id, code });
       cb({ ok: true });
     } catch (err) {
@@ -185,8 +173,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Signal relay: small payloads only
-  // payload: { code, to(optional socketId), data }
   socket.on('signal', (payload = {}) => {
     try {
       if (!consumeToken(socket.id)) {
@@ -197,8 +183,6 @@ io.on('connection', (socket) => {
       if (!code) return;
       const meta = rooms.get(code);
       if (!meta) return;
-
-      // Sanity: ensure sender is part of room (host or peer)
       const isHost = meta.hostSocketId === socket.id;
       const isPeer = meta.peers.has(socket.id);
       if (!isHost && !isPeer) return;
@@ -206,7 +190,6 @@ io.on('connection', (socket) => {
       if (to) {
         io.to(to).emit('signal', { from: socket.id, data });
       } else {
-        // broadcast to room except sender
         socket.to(meta.roomRoomName).emit('signal', { from: socket.id, data });
       }
     } catch (err) {
@@ -214,7 +197,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Transfer-complete: decrement usageLeft and possibly expire
   socket.on('transfer-complete', (payload = {}) => {
     try {
       const { code } = payload;
@@ -234,7 +216,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Leave room
   socket.on('leave-room', (payload = {}) => {
     try {
       const { code } = payload;
@@ -245,7 +226,6 @@ io.on('connection', (socket) => {
         socket.leave(meta.roomRoomName);
         console.log('peer left', socket.id, 'room', code);
       } else if (meta.hostSocketId === socket.id) {
-        // host left -> close room
         io.to(meta.roomRoomName).emit('host-left', { code });
         rooms.delete(code);
         console.log('host left, room removed', code);
@@ -259,7 +239,6 @@ io.on('connection', (socket) => {
     try {
       console.log('disconnect', socket.id, 'reason', reason);
       removeIpConnection(ip, socket.id);
-      // cleanup any rooms referencing this socket
       for (const [code, meta] of rooms.entries()) {
         if (meta.hostSocketId === socket.id) {
           io.to(meta.roomRoomName).emit('host-left', { code });
@@ -270,7 +249,6 @@ io.on('connection', (socket) => {
           io.to(meta.hostSocketId).emit('peer-left', { peerId: socket.id, code });
         }
       }
-      // cleanup rate bucket
       rateBuckets.delete(socket.id);
     } catch (err) {
       console.error('disconnect err', err);
@@ -282,24 +260,12 @@ io.on('connection', (socket) => {
 // Safety handlers
 process.on('uncaughtException', (err) => {
   console.error('UNCAUGHT EXCEPTION', err && err.stack ? err.stack : err);
-  // don't exit automatically — Railway will restart if needed
 });
-process.on('unhandledRejection', (reason, p) => {
+process.on('unhandledRejection', (reason) => {
   console.error('UNHANDLED REJECTION', reason);
 });
 
-// Add simple HTTP endpoints Railway expects
-app.get('/', (req, res) => {
-  // basic landing — used by host platform to verify service is up
-  res.send('Signaling server live');
-});
-
-app.get('/health', (req, res) => {
-  res.json({ ok: true, uptime: process.uptime(), now: Date.now() });
-});
-
-// final listen (Railway sets PORT in env)
-const PORT = process.env.PORT || 3000;
+// Start server
 server.listen(PORT, () => {
   console.log('Signaling server running on PORT:', PORT);
 });

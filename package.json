@@ -1,7 +1,6 @@
 {
   "name": "p2p-signaling",
   "version": "1.0.0",
-  "description": "Socket.IO signaling server for WebRTC",
   "main": "signaling-server.js",
   "scripts": {
     "start": "node signaling-server.js"

@@ -1,272 +1,190 @@
-// signaling-server.js
-// Production-minded Socket.IO signaling server (single-file ready to paste).
-// - Single PORT declaration (no duplicates).
-// - Basic health endpoints for platform checks.
-// - Room/token/ttl/maxPeers/usageLimit support.
-// - Simple rate limiting per-socket.
-// - Uses process.env.PORT (Railway compatible).
+/**
+ * Signaling server for P2P connections using Socket.IO + Express
+ * - Safe startup/shutdown handlers
+ * - Single PORT declaration (uses process.env.PORT if provided)
+ * - Basic in-memory room bookkeeping (no file upload/store on server)
+ *
+ * Replace your current signaling-server.js with this file.
+ */
 
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const crypto = require('crypto');
 
+/* ----------------------------- Config / Globals ---------------------------- */
+const PORT = process.env.PORT || 3000;
+const APP_NAME = 'p2p-signaling';
+
+// Room structure:
+// rooms = Map<roomCode, { hostSocketId, peers: Set<socketId>, roomName }>
+const rooms = new Map();
+
+// Simple rate-bucket map to avoid spamming (basic)
+const rateBuckets = new Map();
+const RATE_LIMIT_WINDOW_MS = 500; // min interval between messages per socket
+
+/* ------------------------------- Express App -------------------------------- */
 const app = express();
+app.get('/', (req, res) => {
+  res.send(`${APP_NAME} signaling server is healthy`);
+});
+
 const server = http.createServer(app);
 
-// SINGLE PORT declaration — DO NOT duplicate this anywhere else in file
-const PORT = process.env.PORT || 3000;
-
-// Configuration (env override)
-const MAX_CONNECTIONS_PER_IP = parseInt(process.env.MAX_CONN_PER_IP || '10', 10);
-const MSGS_PER_SECOND = parseInt(process.env.MSGS_PER_SECOND || '10', 10);
-const ROOM_CODE_LEN = parseInt(process.env.ROOM_CODE_LEN || '7', 10);
-
-// Create Socket.IO server
+/* ------------------------------- Socket.IO --------------------------------- */
 const io = new Server(server, {
-  cors: { origin: '*' } // in production restrict to your domain(s)
+  cors: {
+    origin: '*', // tighten in production to your app's origin
+    methods: ['GET', 'POST']
+  },
+  // pingInterval/pingTimeout can be tuned if needed
 });
 
-// In-memory stores (replace w/ Redis for scale)
-const rooms = new Map(); // code -> meta
-const ipConnections = new Map(); // ip -> Set(socketId)
-const rateBuckets = new Map(); // socketId -> { tokens, lastRefill }
+io.on('connection', (socket) => {
+  console.log('socket connected', socket.id);
 
-// Utils
-function genCode(len = ROOM_CODE_LEN) {
-  return crypto.randomBytes(Math.ceil(len * 3 / 4)).toString('base64')
-    .replace(/[^a-zA-Z0-9]/g, '')
-    .slice(0, len)
-    .toUpperCase();
-}
-function genToken(len = 32) {
-  return crypto.randomBytes(len).toString('hex');
-}
-function nowMs() { return Date.now(); }
-
-// Periodic cleanup for TTL
-const CLEAN_INTERVAL_MS = 30 * 1000;
-setInterval(() => {
-  const now = nowMs();
-  for (const [code, meta] of rooms.entries()) {
-    if (meta.ttlMs && (meta.createdAt + meta.ttlMs) <= now) {
-      io.to(meta.roomRoomName).emit('room-expired', { code, reason: 'ttl' });
-      rooms.delete(code);
-      console.log('room removed (ttl):', code);
-    }
-  }
-}, CLEAN_INTERVAL_MS);
-
-// IP connection helpers
-function addIpConnection(ip, socketId) {
-  const s = ipConnections.get(ip) || new Set();
-  s.add(socketId);
-  ipConnections.set(ip, s);
-}
-function removeIpConnection(ip, socketId) {
-  const s = ipConnections.get(ip);
-  if (!s) return;
-  s.delete(socketId);
-  if (s.size === 0) ipConnections.delete(ip);
-  else ipConnections.set(ip, s);
-}
-function getIpCount(ip) {
-  const s = ipConnections.get(ip);
-  return s ? s.size : 0;
-}
-
-// Rate limiter token-bucket
-function ensureBucket(socketId) {
-  if (!rateBuckets.has(socketId)) {
-    rateBuckets.set(socketId, { tokens: MSGS_PER_SECOND, lastRefill: nowMs() });
-  }
-  return rateBuckets.get(socketId);
-}
-function consumeToken(socketId) {
-  const bucket = ensureBucket(socketId);
-  const now = nowMs();
-  const elapsed = (now - bucket.lastRefill) / 1000;
-  if (elapsed > 0) {
-    const refill = Math.min(MSGS_PER_SECOND, bucket.tokens + elapsed * MSGS_PER_SECOND);
-    bucket.tokens = refill;
-    bucket.lastRefill = now;
-  }
-  if (bucket.tokens >= 1) {
-    bucket.tokens -= 1;
+  // helper: rate limit
+  function allowNow() {
+    const last = rateBuckets.get(socket.id) || 0;
+    const now = Date.now();
+    if (now - last < RATE_LIMIT_WINDOW_MS) return false;
+    rateBuckets.set(socket.id, now);
     return true;
   }
-  return false;
-}
 
-// Simple HTTP endpoints (platform health checks)
-app.get('/', (req, res) => {
-  res.send('Signaling server live');
-});
-app.get('/health', (req, res) => {
-  res.json({ ok: true, uptime: process.uptime(), now: Date.now() });
-});
-
-// Socket.IO handlers
-io.on('connection', (socket) => {
-  const ip = socket.handshake.address || socket.conn.remoteAddress || 'unknown';
-  console.log('connect', socket.id, 'ip', ip);
-
-  addIpConnection(ip, socket.id);
-  if (getIpCount(ip) > MAX_CONNECTIONS_PER_IP) {
-    console.warn('ip connection limit reached for', ip);
-    socket.emit('error', { code: 'ip_limit', message: 'Too many connections from this IP' });
-    socket.disconnect(true);
-    return;
-  }
-
-  socket.on('create-room', (opts = {}, cb = () => {}) => {
+  // create room
+  socket.on('create-room', (opts = {}, cb) => {
     try {
-      if (!consumeToken(socket.id)) return cb({ ok: false, error: 'rate_limit' });
+      if (!allowNow()) return cb && cb({ ok: false, reason: 'rate_limited' });
 
-      const code = genCode();
-      const token = genToken(16);
-      const ttlMinutes = Math.max(1, parseInt(opts.ttlMinutes || 60, 10));
-      const maxPeers = Math.max(1, parseInt(opts.maxPeers || 1, 10));
-      const usageLeft = (typeof opts.usageLimit === 'number' && opts.usageLimit > 0) ? Math.floor(opts.usageLimit) : null;
-
+      // room code: 6 chars base36
+      const code = (Math.random().toString(36).slice(2, 8) || Date.now().toString(36).slice(-6)).toUpperCase();
       const meta = {
         hostSocketId: socket.id,
-        token,
         peers: new Set(),
-        createdAt: nowMs(),
-        ttlMs: ttlMinutes * 60 * 1000,
-        maxPeers,
-        usageLeft,
-        roomRoomName: `room-${code}`
-     server
-        rooms.set(code, meta);
-      socket.join(meta.roomRoomName);
-
-      console.log('room created', code, 'host', socket.id);
-      cb({ ok: true, code, token, ttlMinutes, maxPeers, usageLeft });
+        roomName: `room-${code}`
+      };
+      rooms.set(code, meta);
+      socket.join(meta.roomName);
+      console.log('room created', code, 'by', socket.id);
+      cb && cb({ ok: true, code });
     } catch (err) {
-      console.error('create-room error', err);
-      cb({ ok: false, error: 'server_error' });
+      console.error('create-room err', err);
+      cb && cb({ ok: false, reason: 'error' });
     }
   });
 
-  socket.on('join-room', (payload = {}, cb = () => {}) => {
+  // join room
+  socket.on('join-room', (payload = {}, cb) => {
     try {
-      if (!consumeToken(socket.id)) return cb({ ok: false, error: 'rate_limit' });
-      const { code, token } = payload;
-      if (!code || !token) return cb({ ok: false, error: 'missing_params' });
+      if (!allowNow()) return cb && cb({ ok: false, reason: 'rate_limited' });
+
+      const { code } = payload;
+      if (!code || !rooms.has(code)) return cb && cb({ ok: false, reason: 'room_not_found' });
 
       const meta = rooms.get(code);
-      if (!meta) return cb({ ok: false, error: 'room_not_found' });
-      if (meta.token !== token) return cb({ ok: false, error: 'invalid_token' });
-      if (meta.maxPeers && meta.peers.size >= meta.maxPeers) return cb({ ok: false, error: 'max_peers_reached' });
-
+      // enforce max peers if you want (optional)
       meta.peers.add(socket.id);
-      socket.join(meta.roomRoomName);
-      console.log('peer joined', socket.id, 'room', code);
+      socket.join(meta.roomName);
+
+      // notify host that a peer joined
       io.to(meta.hostSocketId).emit('peer-joined', { peerId: socket.id, code });
-      cb({ ok: true });
+      console.log('peer joined', socket.id, 'to', code);
+
+      cb && cb({ ok: true, hostId: meta.hostSocketId, code });
     } catch (err) {
-      console.error('join-room error', err);
-      cb({ ok: false, error: 'server_error' });
+      console.error('join-room err', err);
+      cb && cb({ ok: false, reason: 'error' });
     }
   });
 
-  socket.on('signal', (payload = {}) => {
+  // forward signaling messages: offer/answer/candidate/custom
+  socket.on('signal', (data = {}) => {
     try {
-      if (!consumeToken(socket.id)) {
-        socket.emit('error', { code: 'rate_limit' });
-        return;
-      }
-      const { code, to, data } = payload;
-      if (!code) return;
-      const meta = rooms.get(code);
-      if (!meta) return;
-      const isHost = meta.hostSocketId === socket.id;
-      const isPeer = meta.peers.has(socket.id);
-      if (!isHost && !isPeer) return;
-
-      if (to) {
-        io.to(to).emit('signal', { from: socket.id, data });
-      } else {
-        socket.to(meta.roomRoomName).emit('signal', { from: socket.id, data });
-      }
+      if (!allowNow()) return;
+      const { to, payload } = data;
+      if (!to) return;
+      io.to(to).emit('signal', { from: socket.id, payload });
     } catch (err) {
-      console.error('signal error', err);
+      console.error('signal err', err);
     }
   });
 
-  socket.on('transfer-complete', (payload = {}) => {
+  // host can start transfer or send custom events to all peers in room
+  socket.on('host-event', (data = {}) => {
     try {
-      const { code } = payload;
+      if (!allowNow()) return;
+      const { code, eventName, payload } = data;
       const meta = rooms.get(code);
       if (!meta) return;
-      if (typeof meta.usageLeft === 'number') {
-        meta.usageLeft = Math.max(0, meta.usageLeft - 1);
-        console.log('usage decremented', code, '->', meta.usageLeft);
-        if (meta.usageLeft === 0) {
-          io.to(meta.roomRoomName).emit('room-expired', { code, reason: 'usage_exhausted' });
-          rooms.delete(code);
-          console.log('room removed (usage exhausted):', code);
-        }
-      }
+      io.to(meta.roomName).emit(eventName, { from: socket.id, payload });
     } catch (err) {
-      console.error('transfer-complete err', err);
+      console.error('host-event err', err);
     }
   });
 
-  socket.on('leave-room', (payload = {}) => {
+  // leave room (client asks to leave)
+  socket.on('leave-room', (data = {}) => {
     try {
-      const { code } = payload;
+      const { code } = data;
       const meta = rooms.get(code);
       if (!meta) return;
-      if (meta.peers.has(socket.id)) {
-        meta.peers.delete(socket.id);
-        socket.leave(meta.roomRoomName);
-        console.log('peer left', socket.id, 'room', code);
-      } else if (meta.hostSocketId === socket.id) {
-        io.to(meta.roomRoomName).emit('host-left', { code });
+      // remove peer or if host left, remove room
+      if (meta.hostSocketId === socket.id) {
+        io.to(meta.roomName).emit('host-left', { code });
+        // close room
         rooms.delete(code);
+        io.in(meta.roomName).socketsLeave(meta.roomName);
         console.log('host left, room removed', code);
+      } else if (meta.peers.has(socket.id)) {
+        meta.peers.delete(socket.id);
+        socket.leave(meta.roomName);
+        io.to(meta.hostSocketId).emit('peer-left', { peerId: socket.id, code });
+        console.log('peer left', socket.id, 'from', code);
       }
     } catch (err) {
       console.error('leave-room err', err);
     }
   });
 
+  // disconnect handling
   socket.on('disconnect', (reason) => {
     try {
       console.log('disconnect', socket.id, 'reason', reason);
-      removeIpConnection(ip, socket.id);
+      // cleanup any rooms referencing this socket
       for (const [code, meta] of rooms.entries()) {
         if (meta.hostSocketId === socket.id) {
-          io.to(meta.roomRoomName).emit('host-left', { code });
+          // notify peers and remove room
+          io.to(meta.roomName).emit('host-left', { code });
           rooms.delete(code);
-          console.log('room removed (host disconnect):', code);
+          io.in(meta.roomName).socketsLeave(meta.roomName);
+          console.log('room removed (host disconnected):', code);
         } else if (meta.peers.has(socket.id)) {
           meta.peers.delete(socket.id);
+          // inform host
           io.to(meta.hostSocketId).emit('peer-left', { peerId: socket.id, code });
+          console.log('peer removed on disconnect', socket.id, 'from', code);
         }
       }
+      // cleanup bucket
       rateBuckets.delete(socket.id);
     } catch (err) {
       console.error('disconnect err', err);
     }
   });
-
 });
 
-// Safety handlers
+/* --------------------------- Error / Safety Handlers ------------------------- */
 process.on('uncaughtException', (err) => {
   console.error('UNCAUGHT EXCEPTION', err && err.stack ? err.stack : err);
+  // do not exit forcibly here: allow graceful handlers to run or restart platform
 });
+
 process.on('unhandledRejection', (reason) => {
   console.error('UNHANDLED REJECTION', reason);
 });
 
-// Start server
-server.listen(PORT, () => {
-  // Graceful shutdown handlers
+/* ------------------------------- Shutdown ---------------------------------- */
 const shutdown = (signal) => {
   console.warn(`Received ${signal} - shutting down gracefully...`);
   try {
@@ -274,8 +192,10 @@ const shutdown = (signal) => {
       console.log('HTTP server closed.');
       process.exit(0);
     });
+
+    // Force exit if not closed in time
     setTimeout(() => {
-      console.error('Force exit after timeout.');
+      console.error('Force exit after shutdown timeout.');
       process.exit(1);
     }, 10000).unref();
   } catch (err) {
@@ -286,5 +206,8 @@ const shutdown = (signal) => {
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
-  console.log('Signaling server running on PORT:', PORT);
+
+/* ------------------------------- Start Server ------------------------------- */
+server.listen(PORT, () => {
+  console.log(`${APP_NAME} listening on PORT:`, PORT);
 });

@@ -138,9 +138,8 @@ io.on('connection', (socket) => {
         maxPeers,
         usageLeft,
         roomRoomName: `room-${code}`
-      };
-
-      rooms.set(code, meta);
+     server
+        rooms.set(code, meta);
       socket.join(meta.roomRoomName);
 
       console.log('room created', code, 'host', socket.id);
@@ -267,5 +266,25 @@ process.on('unhandledRejection', (reason) => {
 
 // Start server
 server.listen(PORT, () => {
+  // Graceful shutdown handlers
+const shutdown = (signal) => {
+  console.warn(`Received ${signal} - shutting down gracefully...`);
+  try {
+    server.close(() => {
+      console.log('HTTP server closed.');
+      process.exit(0);
+    });
+    setTimeout(() => {
+      console.error('Force exit after timeout.');
+      process.exit(1);
+    }, 10000).unref();
+  } catch (err) {
+    console.error('Error during shutdown:', err);
+    process.exit(1);
+  }
+};
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
   console.log('Signaling server running on PORT:', PORT);
 });

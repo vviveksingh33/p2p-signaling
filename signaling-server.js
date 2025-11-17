@@ -288,6 +288,18 @@ process.on('unhandledRejection', (reason, p) => {
   console.error('UNHANDLED REJECTION', reason);
 });
 
+// Add simple HTTP endpoints Railway expects
+app.get('/', (req, res) => {
+  // basic landing — used by host platform to verify service is up
+  res.send('Signaling server live');
+});
+
+app.get('/health', (req, res) => {
+  res.json({ ok: true, uptime: process.uptime(), now: Date.now() });
+});
+
+// final listen (Railway sets PORT in env)
+const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log('Signaling server running on PORT:', PORT);
 });
